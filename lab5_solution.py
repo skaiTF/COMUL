@@ -12,7 +12,9 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from skimage.transform import resize
-from skimage import io
+from skimage import io, exposure
+from skimage.feature import hog
+from sklearn.decomposition import PCA
 
 # Seed initialization
 SEED = 1234
@@ -36,9 +38,9 @@ class_names = ["Bart", "Homer", "Marge", "Lisa"]
 
 def load_image(f, size=(128, 128)):
     img = io.imread(f)
-    if img.ndim == 3 and img.shape[2] == 4:  # drop alpha channel
+    if img.ndim == 3 and img.shape[2] == 4:
         img = img[:, :, :3]
-    if img.ndim == 2:                         # grayscale → RGB
+    if img.ndim == 2:
         img = np.stack([img] * 3, axis=-1)
     return torch.tensor(resize(img, size, anti_aliasing=True), dtype=torch.float32)
 
@@ -104,6 +106,16 @@ def extract_features(image):
     # Downscaled grayscale 16x16 = 256 values
     gray = 0.2989*img[:,:,0] + 0.5870*img[:,:,1] + 0.1140*img[:,:,2]
     features.append(resize(gray, (16, 16), anti_aliasing=True).astype(np.float32).flatten())
+
+    # HOG features
+    hog_features = hog(
+        gray,
+        orientations=8,
+        pixels_per_cell=(16, 16),
+        cells_per_block=(2, 2),
+        feature_vector=True
+    ).astype(np.float32)
+    features.append(hog_features)
  
     return torch.tensor(np.concatenate(features))
  
@@ -124,12 +136,48 @@ for i, img in enumerate(X_test):
     sys.stdout.flush()
 X_test_feat = torch.stack(test_feats)
 print(f"\nFeature vector size: {X_train_feat.shape[1]}")
- 
+
+# ── HOG visualisation ─────────────────────────────────────────────────────────
+sample = X_train[0].numpy()
+gray_sample = 0.2989*sample[:,:,0] + 0.5870*sample[:,:,1] + 0.1140*sample[:,:,2]
+
+_, hog_image = hog(
+    gray_sample,
+    orientations=8,
+    pixels_per_cell=(16, 16),
+    cells_per_block=(2, 2),
+    visualize=True
+)
+hog_image = exposure.rescale_intensity(hog_image, in_range=(0, 10))
+
+fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 4))
+ax1.imshow(sample)
+ax1.set_title(f"Original ({inv_label_dict[y_train[0].item()]})")
+ax1.axis("off")
+ax2.imshow(hog_image, cmap="gray")
+ax2.set_title("HOG")
+ax2.axis("off")
+plt.tight_layout()
+plt.savefig("hog_example.png", dpi=150)
+print("HOG example saved to hog_example.png")
+
 # Save features to .pkl
 with open("data_features.pkl", "wb") as f:
     pickle.dump(((X_train_feat, y_train), (X_test_feat, y_test), label_dict), f)
 print("Features saved to 'data_features.pkl'")
  
+# Apply PCA to reduce dimensionality
+# Fit only on training set to avoid data leakage
+pca = PCA(n_components=100)
+X_train_feat_np = pca.fit_transform(X_train_feat.numpy())
+X_test_feat_np  = pca.transform(X_test_feat.numpy())
+
+X_train_feat = torch.tensor(X_train_feat_np, dtype=torch.float32)
+X_test_feat  = torch.tensor(X_test_feat_np,  dtype=torch.float32)
+
+print(f"Feature size after PCA: {X_train_feat.shape[1]}")
+print(f"Variance explained: {pca.explained_variance_ratio_.sum()*100:.1f}%")
+
 
 feat_mean = X_train_feat.mean(0)
 feat_std  = X_train_feat.std(0) + 1e-8
@@ -166,8 +214,9 @@ class LogisticRegression(torch.nn.Module):
         return 1/(1 + torch.exp(-z))
  
     def softmax(self, z):
+        z = z - z.max(dim=1, keepdim=True).values
         return torch.exp(z) / torch.exp(z).sum(1).unsqueeze(1)
- 
+    
  
 def loss_fn_multiclass(y_true, y_pred):
     return -(y_true * torch.log(y_pred + 1e-9)).sum(1).mean()
@@ -179,7 +228,7 @@ def accuracy(y_true, y_pred):
 print("\n── Training ──────────────────────────────────────────────────────────────")
  
 steps = 2000
-lr    = 0.1
+lr    = 0.01
  
 log_reg = LogisticRegression(X_tr.shape[1], y_train_oh.shape[1])
 log_reg._reset_weights()
@@ -216,8 +265,6 @@ for i in range(steps):
     sys.stdout.flush()
  
 print(f"\nFinal test accuracy: {test_accs[-1]*100:.1f}%")
- 
-
  
 # Training curves
 fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))

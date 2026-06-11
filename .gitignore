@@ -65,3 +65,6 @@ dmypy.json
 .venv.local
 
 /data
+
+*.png
+*.pkl
